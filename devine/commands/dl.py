@@ -40,7 +40,7 @@ from rich.tree import Tree
 
 from devine.core.config import config
 from devine.core.console import console
-from devine.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack, context_settings
+from devine.core.constants import DOWNLOAD_CANCELLED, AnyTrack, context_settings
 from devine.core.credential import Credential
 from devine.core.downloaders import downloader
 from devine.core.drm import DRM_T, Widevine
@@ -119,8 +119,6 @@ class dl:
                   help="Skip downloading and list available tracks and what tracks would have been downloaded.")
     @click.option("--list-titles", is_flag=True, default=False,
                   help="Skip downloading, only list available titles that would have been downloaded.")
-    @click.option("--skip-dl", is_flag=True, default=False,
-                  help="Skip downloading while still retrieving the decryption keys.")
     @click.option("--export", type=Path,
                   help="Export Decryption Keys as you obtain them to a JSON file.")
     @click.option("--cdm-only/--vaults-only", is_flag=True, default=None,
@@ -272,7 +270,6 @@ class dl:
         chapters_only: bool,
         slow: bool, list_: bool,
         list_titles: bool,
-        skip_dl: bool,
         export: Optional[Path],
         cdm_only: Optional[bool],
         no_proxy: bool,
@@ -462,9 +459,6 @@ class dl:
 
             dl_start_time = time.time()
 
-            if skip_dl:
-                DOWNLOAD_LICENCE_ONLY.set()
-
             try:
                 with Live(
                     Padding(
@@ -529,138 +523,204 @@ class dl:
                 ))
                 return
 
-            if skip_dl:
-                console.log("Skipped downloads as --skip-dl was used...")
-            else:
-                dl_time = time_elapsed_since(dl_start_time)
-                console.print(Padding(
-                    f"Track downloads finished in [progress.elapsed]{dl_time}[/]",
-                    (0, 5)
-                ))
+            dl_time = time_elapsed_since(dl_start_time)
+            console.print(Padding(
+                f"Track downloads finished in [progress.elapsed]{dl_time}[/]",
+                (0, 5)
+            ))
 
-                video_track_n = 0
+            video_track_n = 0
 
-                while (
-                    not title.tracks.subtitles and
-                    len(title.tracks.videos) > video_track_n and
-                    any(
-                        x.get("codec_name", "").startswith("eia_")
-                        for x in ffprobe(title.tracks.videos[video_track_n].path).get("streams", [])
-                    )
-                ):
-                    with console.status(f"Checking Video track {video_track_n + 1} for Closed Captions..."):
-                        try:
-                            # TODO: Figure out the real language, it might be different
-                            #       EIA-CC tracks sadly don't carry language information :(
-                            # TODO: Figure out if the CC language is original lang or not.
-                            #       Will need to figure out above first to do so.
-                            video_track = title.tracks.videos[video_track_n]
-                            track_id = f"ccextractor-{video_track.id}"
-                            cc_lang = title.language or video_track.language
-                            cc = video_track.ccextractor(
-                                track_id=track_id,
-                                out_path=config.directories.temp / config.filenames.subtitle.format(
-                                    id=track_id,
-                                    language=cc_lang
-                                ),
-                                language=cc_lang,
-                                original=False
-                            )
-                            if cc:
-                                # will not appear in track listings as it's added after all times it lists
-                                title.tracks.add(cc)
-                                self.log.info(f"Extracted a Closed Caption from Video track {video_track_n + 1}")
-                            else:
-                                self.log.info(f"No Closed Captions were found in Video track {video_track_n + 1}")
-                        except EnvironmentError:
-                            self.log.error(
-                                "Cannot extract Closed Captions as the ccextractor executable was not found..."
-                            )
-                            break
-                    video_track_n += 1
-
-                with console.status(f"Converting Subtitles to {sub_format.name}..."):
-                    for subtitle in title.tracks.subtitles:
-                        if subtitle.codec != sub_format:
-                            subtitle.convert(sub_format)
-
-                with console.status("Repackaging tracks with FFMPEG..."):
-                    has_repacked = False
-                    for track in title.tracks:
-                        if track.needs_repack:
-                            track.repackage()
-                            has_repacked = True
-                            if callable(track.OnRepacked):
-                                track.OnRepacked(track)
-                    if has_repacked:
-                        # we don't want to fill up the log with "Repacked x track"
-                        self.log.info("Repacked one or more tracks with FFMPEG")
-
-                muxed_paths = []
-
-                if isinstance(title, (Movie, Episode)):
-                    progress = Progress(
-                        TextColumn("[progress.description]{task.description}"),
-                        SpinnerColumn(finished_text=""),
-                        BarColumn(),
-                        "•",
-                        TimeRemainingColumn(compact=True, elapsed_when_finished=True),
-                        console=console
-                    )
-                    multi_jobs = len(title.tracks.videos) > 1
-                    tasks = [
-                        progress.add_task(
-                            f"Multiplexing{f' {x.height}p' if multi_jobs else ''}...",
-                            total=None,
-                            start=False
+            while (
+                not title.tracks.subtitles and
+                len(title.tracks.videos) > video_track_n and
+                any(
+                    x.get("codec_name", "").startswith("eia_")
+                    for x in ffprobe(title.tracks.videos[video_track_n].path).get("streams", [])
+                )
+            ):
+                with console.status(f"Checking Video track {video_track_n + 1} for Closed Captions..."):
+                    try:
+                        # TODO: Figure out the real language, it might be different
+                        #       EIA-CC tracks sadly don't carry language information :(
+                        # TODO: Figure out if the CC language is original lang or not.
+                        #       Will need to figure out above first to do so.
+                        video_track = title.tracks.videos[video_track_n]
+                        track_id = f"ccextractor-{video_track.id}"
+                        cc_lang = title.language or video_track.language
+                        cc = video_track.ccextractor(
+                            track_id=track_id,
+                            out_path=config.directories.temp / config.filenames.subtitle.format(
+                                id=track_id,
+                                language=cc_lang
+                            ),
+                            language=cc_lang,
+                            original=False
                         )
-                        for x in title.tracks.videos or [None]
-                    ]
-                    with Live(
-                        Padding(progress, (0, 5, 1, 5)),
-                        console=console
-                    ):
-                        for task, video_track in zip_longest(tasks, title.tracks.videos, fillvalue=None):
-                            if video_track:
-                                title.tracks.videos = [video_track]
-                            progress.start_task(task)  # TODO: Needed?
-                            muxed_path, return_code = title.tracks.mux(
-                                str(title),
-                                progress=partial(progress.update, task_id=task),
-                                delete=False
-                            )
-                            muxed_paths.append(muxed_path)
-                            if return_code == 1:
-                                self.log.warning("mkvmerge had at least one warning, will continue anyway...")
-                            elif return_code >= 2:
-                                self.log.error(f"Failed to Mux video to Matroska file ({return_code})")
-                                sys.exit(1)
-                            if video_track:
-                                video_track.delete()
-                        for track in title.tracks:
-                            track.delete()
-                else:
-                    # dont mux
-                    muxed_paths.append(title.tracks.audio[0].path)
+                        if cc:
+                            # will not appear in track listings as it's added after all times it lists
+                            title.tracks.add(cc)
+                            self.log.info(f"Extracted a Closed Caption from Video track {video_track_n + 1}")
+                        else:
+                            self.log.info(f"No Closed Captions were found in Video track {video_track_n + 1}")
+                    except EnvironmentError:
+                        self.log.error(
+                            "Cannot extract Closed Captions as the ccextractor executable was not found..."
+                        )
+                        break
+                video_track_n += 1
 
-                for muxed_path in muxed_paths:
-                    media_info = MediaInfo.parse(muxed_path)
-                    final_dir = config.directories.downloads
-                    final_filename = title.get_filename(media_info, show_service=not no_source)
+            with console.status(f"Converting Subtitles to {sub_format.name}..."):
+                for subtitle in title.tracks.subtitles:
+                    if subtitle.codec != sub_format:
+                        subtitle.convert(sub_format)
 
-                    if not no_folder and isinstance(title, (Episode, Song)):
-                        final_dir /= title.get_filename(media_info, show_service=not no_source, folder=True)
+            with console.status("Repackaging tracks with FFMPEG..."):
+                has_repacked = False
+                for track in title.tracks:
+                    if track.needs_repack:
+                        track.repackage()
+                        has_repacked = True
+                        if callable(track.OnRepacked):
+                            track.OnRepacked(track)
+                if has_repacked:
+                    # we don't want to fill up the log with "Repacked x track"
+                    self.log.info("Repacked one or more tracks with FFMPEG")
 
-                    final_dir.mkdir(parents=True, exist_ok=True)
-                    final_path = final_dir / f"{final_filename}{muxed_path.suffix}"
+            muxed_paths = []
 
-                    shutil.move(muxed_path, final_path)
+            if isinstance(title, (Movie, Episode)):
+                progress = Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    SpinnerColumn(finished_text=""),
+                    BarColumn(),
+                    "•",
+                    TimeRemainingColumn(compact=True, elapsed_when_finished=True),
+                    console=console
+                )
+                multi_jobs = len(title.tracks.videos) > 1
+                tasks = [
+                    progress.add_task(
+                        f"Multiplexing{f' {x.height}p' if multi_jobs else ''}...",
+                        total=None,
+                        start=False
+                    )
+                    if cc:
+                        # will not appear in track listings as it's added after all times it lists
+                        title.tracks.add(cc)
+                        self.log.info(f"Extracted a Closed Caption from Video track {video_track_n + 1}")
+                    else:
+                        self.log.info(f"No Closed Captions were found in Video track {video_track_n + 1}")
+                except EnvironmentError:
+                    self.log.error(
+                        "Cannot extract Closed Captions as the ccextractor executable was not found..."
+                    )
+                    break
+            video_track_n += 1
 
-                title_dl_time = time_elapsed_since(dl_start_time)
-                console.print(Padding(
-                    f":tada: Title downloaded in [progress.elapsed]{title_dl_time}[/]!",
-                    (0, 5, 1, 5)
-                ))
+            with console.status(f"Converting Subtitles to {sub_format.name}..."):
+                for subtitle in title.tracks.subtitles:
+                    if subtitle.codec != sub_format:
+                        writer = {
+                            Subtitle.Codec.SubRip: pycaption.SRTWriter,
+                            Subtitle.Codec.SubStationAlpha: None,
+                            Subtitle.Codec.SubStationAlphav4: None,
+                            Subtitle.Codec.TimedTextMarkupLang: pycaption.DFXPWriter,
+                            Subtitle.Codec.WebVTT: pycaption.WebVTTWriter,
+                            # MPEG-DASH box-encapsulated subtitle formats
+                            Subtitle.Codec.fTTML: None,
+                            Subtitle.Codec.fVTT: None,
+                        }[sub_format]
+                        if writer is None:
+                            self.log.error(f"Cannot yet convert {subtitle.codec} to {sub_format.name}...")
+                            sys.exit(1)
+
+                        caption_set = subtitle.parse(subtitle.path.read_bytes(), subtitle.codec)
+                        subtitle.merge_same_cues(caption_set)
+
+                        subtitle_text = writer().write(caption_set)
+                        subtitle.path.write_text(subtitle_text, encoding="utf8")
+
+                        subtitle.codec = sub_format
+                        subtitle.move(subtitle.path.with_suffix(f".{sub_format.value.lower()}"))
+
+            with console.status("Repackaging tracks with FFMPEG..."):
+                has_repacked = False
+                for track in title.tracks:
+                    if track.needs_repack:
+                        track.repackage()
+                        has_repacked = True
+                        if callable(track.OnRepacked):
+                            track.OnRepacked(track)
+                if has_repacked:
+                    # we don't want to fill up the log with "Repacked x track"
+                    self.log.info("Repacked one or more tracks with FFMPEG")
+
+            muxed_paths = []
+
+            if isinstance(title, (Movie, Episode)):
+                progress = Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    SpinnerColumn(finished_text=""),
+                    BarColumn(),
+                    "•",
+                    TimeRemainingColumn(compact=True, elapsed_when_finished=True),
+                    console=console
+                )
+                multi_jobs = len(title.tracks.videos) > 1
+                tasks = [
+                    progress.add_task(
+                        f"Multiplexing{f' {x.height}p' if multi_jobs else ''}...",
+                        total=None,
+                        start=False
+                    )
+                    for x in title.tracks.videos or [None]
+                ]
+                with Live(
+                    Padding(progress, (0, 5, 1, 5)),
+                    console=console
+                ):
+                    for task, video_track in zip_longest(tasks, title.tracks.videos, fillvalue=None):
+                        if video_track:
+                            title.tracks.videos = [video_track]
+                        progress.start_task(task)  # TODO: Needed?
+                        muxed_path, return_code = title.tracks.mux(
+                            str(title),
+                            progress=partial(progress.update, task_id=task),
+                            delete=False
+                        )
+                        muxed_paths.append(muxed_path)
+                        if return_code == 1:
+                            self.log.warning("mkvmerge had at least one warning, will continue anyway...")
+                        elif return_code >= 2:
+                            self.log.error(f"Failed to Mux video to Matroska file ({return_code})")
+                            sys.exit(1)
+                        if video_track:
+                            video_track.delete()
+                    for track in title.tracks:
+                        track.delete()
+            else:
+                # dont mux
+                muxed_paths.append(title.tracks.audio[0].path)
+
+            for muxed_path in muxed_paths:
+                media_info = MediaInfo.parse(muxed_path)
+                final_dir = config.directories.downloads
+                final_filename = title.get_filename(media_info, show_service=not no_source)
+
+                if not no_folder and isinstance(title, (Episode, Song)):
+                    final_dir /= title.get_filename(media_info, show_service=not no_source, folder=True)
+
+                final_dir.mkdir(parents=True, exist_ok=True)
+                final_path = final_dir / f"{final_filename}{muxed_path.suffix}"
+
+                shutil.move(muxed_path, final_path)
+
+            title_dl_time = time_elapsed_since(dl_start_time)
+            console.print(Padding(
+                f":tada: Title downloaded in [progress.elapsed]{title_dl_time}[/]!",
+                (0, 5, 1, 5)
+            ))
 
             # update cookies
             cookie_file = config.directories.cookies / service.__class__.__name__ / f"{self.profile}.txt"
@@ -803,9 +863,6 @@ class dl:
         prepare_drm: Callable,
         progress: partial
     ):
-        if DOWNLOAD_LICENCE_ONLY.is_set():
-            progress(downloaded="[yellow]SKIPPING")
-
         if DOWNLOAD_CANCELLED.is_set():
             progress(downloaded="[yellow]CANCELLED")
             return
@@ -829,18 +886,17 @@ class dl:
             if save_dir.exists() and save_dir.name.endswith("_segments"):
                 shutil.rmtree(save_dir)
 
-        if not DOWNLOAD_LICENCE_ONLY.is_set():
-            if config.directories.temp.is_file():
-                self.log.error(f"Temp Directory '{config.directories.temp}' must be a Directory, not a file")
-                sys.exit(1)
+        if config.directories.temp.is_file():
+            self.log.error(f"Temp Directory '{config.directories.temp}' must be a Directory, not a file")
+            sys.exit(1)
 
-            config.directories.temp.mkdir(parents=True, exist_ok=True)
+        config.directories.temp.mkdir(parents=True, exist_ok=True)
 
-            # Delete any pre-existing temp files matching this track.
-            # We can't re-use or continue downloading these tracks as they do not use a
-            # lock file. Or at least the majority don't. Even if they did I've encountered
-            # corruptions caused by sudden interruptions to the lock file.
-            cleanup()
+        # Delete any pre-existing temp files matching this track.
+        # We can't re-use or continue downloading these tracks as they do not use a
+        # lock file. Or at least the majority don't. Even if they did I've encountered
+        # corruptions caused by sudden interruptions to the lock file.
+        cleanup()
 
         try:
             if track.descriptor == track.Descriptor.M3U:
@@ -888,35 +944,32 @@ class dl:
                     else:
                         drm = None
 
-                    if DOWNLOAD_LICENCE_ONLY.is_set():
-                        progress(downloaded="[yellow]SKIPPED")
-                    else:
-                        downloader(
-                            uri=track.url,
-                            out=save_path,
-                            headers=service.session.headers,
-                            cookies=service.session.cookies,
-                            proxy=proxy,
-                            progress=progress
-                        )
+                    downloader(
+                        uri=track.url,
+                        out=save_path,
+                        headers=service.session.headers,
+                        cookies=service.session.cookies,
+                        proxy=proxy,
+                        progress=progress
+                    )
 
-                        track.path = save_path
+                    track.path = save_path
 
-                        if drm:
-                            progress(downloaded="Decrypting", completed=0, total=100)
-                            drm.decrypt(save_path)
-                            track.drm = None
-                            if callable(track.OnDecrypted):
-                                track.OnDecrypted(track)
-                            progress(downloaded="Decrypted", completed=100)
+                    if drm:
+                        progress(downloaded="Decrypting", completed=0, total=100)
+                        drm.decrypt(save_path)
+                        track.drm = None
+                        if callable(track.OnDecrypted):
+                            track.OnDecrypted(track)
+                        progress(downloaded="Decrypted", completed=100)
 
-                        if isinstance(track, Subtitle):
-                            track_data = track.path.read_bytes()
-                            track_data = try_ensure_utf8(track_data)
-                            track_data = html.unescape(track_data.decode("utf8")).encode("utf8")
-                            track.path.write_bytes(track_data)
+                    if isinstance(track, Subtitle):
+                        track_data = track.path.read_bytes()
+                        track_data = try_ensure_utf8(track_data)
+                        track_data = html.unescape(track_data.decode("utf8")).encode("utf8")
+                        track.path.write_bytes(track_data)
 
-                        progress(downloaded="Downloaded")
+                    progress(downloaded="Downloaded")
                 except KeyboardInterrupt:
                     DOWNLOAD_CANCELLED.set()
                     progress(downloaded="[yellow]CANCELLED")
@@ -926,20 +979,18 @@ class dl:
                     progress(downloaded="[red]FAILED")
                     raise
         except (Exception, KeyboardInterrupt):
-            if not DOWNLOAD_LICENCE_ONLY.is_set():
-                cleanup()
+            cleanup()
             raise
 
         if DOWNLOAD_CANCELLED.is_set():
             # we stopped during the download, let's exit
             return
 
-        if not DOWNLOAD_LICENCE_ONLY.is_set():
-            if track.path.stat().st_size <= 3:  # Empty UTF-8 BOM == 3 bytes
-                raise IOError("Download failed, the downloaded file is empty.")
+        if track.path.stat().st_size <= 3:  # Empty UTF-8 BOM == 3 bytes
+            raise IOError("Download failed, the downloaded file is empty.")
 
-            if callable(track.OnDownloaded):
-                track.OnDownloaded(track)
+        if callable(track.OnDownloaded):
+            track.OnDownloaded(track)
 
     @staticmethod
     def get_profile(service: str) -> Optional[str]:

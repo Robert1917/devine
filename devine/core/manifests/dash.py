@@ -26,7 +26,7 @@ from requests import Session
 from requests.cookies import RequestsCookieJar
 from rich import filesize
 
-from devine.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack
+from devine.core.constants import DOWNLOAD_CANCELLED, AnyTrack
 from devine.core.downloaders import downloader
 from devine.core.downloaders import requests as requests_downloader
 from devine.core.drm import Widevine
@@ -404,10 +404,6 @@ class DASH:
                         raise
             else:
                 drm = None
-
-            if DOWNLOAD_LICENCE_ONLY.is_set():
-                progress(downloaded="[yellow]SKIPPED")
-                return
 
             progress(total=len(segments))
 

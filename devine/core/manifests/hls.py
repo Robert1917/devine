@@ -24,7 +24,7 @@ from pywidevine.pssh import PSSH
 from requests import Session
 from rich import filesize
 
-from devine.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack
+from devine.core.constants import DOWNLOAD_CANCELLED, AnyTrack
 from devine.core.downloaders import downloader
 from devine.core.downloaders import requests as requests_downloader
 from devine.core.drm import DRM_T, ClearKey, Widevine
@@ -290,10 +290,6 @@ class HLS:
                     # it successfully downloaded, and it was not cancelled
                     progress(advance=1)
 
-                    if download_size == -1:  # skipped for --skip-dl
-                        progress(downloaded="[yellow]SKIPPING")
-                        continue
-
                     now = time.time()
                     time_since = now - last_speed_refresh
 
@@ -306,9 +302,6 @@ class HLS:
                         progress(downloaded=f"HLS {filesize.decimal(download_speed)}/s")
                         last_speed_refresh = now
                         download_sizes.clear()
-
-        if DOWNLOAD_LICENCE_ONLY.is_set():
-            return
 
         with open(save_path, "wb") as f:
             for segment_file in sorted(save_dir.iterdir()):
@@ -362,6 +355,8 @@ class HLS:
                 if the Segment's DRM uses Widevine.
             proxy: Proxy URI to use when downloading the Segment file.
             session: Python-Requests Session used when requesting init data.
+            stop_event: Prematurely stop the Download from beginning. Useful if ran from
+                a Thread Pool. It will raise a KeyboardInterrupt if set.
 
         Returns the file size of the downloaded Segment in bytes.
         """
@@ -421,9 +416,6 @@ class HLS:
                         newest_segment_key = (drm, segment.keys)
             finally:
                 segment_key.put(newest_segment_key)
-
-            if DOWNLOAD_LICENCE_ONLY.is_set():
-                return -1
 
         headers_ = session.headers
         if segment.byterange:
