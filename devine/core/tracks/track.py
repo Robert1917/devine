@@ -17,7 +17,6 @@ from devine.core.config import config
 from devine.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, TERRITORY_MAP
 from devine.core.downloaders import downloader
 from devine.core.drm import DRM_T, Widevine
-from devine.core.service import Service
 from devine.core.utilities import get_binary_path, get_boxes, try_ensure_utf8
 from devine.core.utils.subprocess import ffprobe
 
@@ -222,7 +221,7 @@ class Track:
 
         return init_data
 
-    def download(self, service: Service, prepare_drm: Callable, progress: partial) -> None:
+    def download(self, session: requests.Session, prepare_drm: Callable, progress: partial) -> None:
         if DOWNLOAD_LICENCE_ONLY.is_set():
             progress(downloaded="[yellow]SKIPPING")
 
@@ -232,7 +231,7 @@ class Track:
 
         log = logging.getLogger("Track")
 
-        proxy = next(iter(service.session.proxies.values()), None)
+        proxy = next(iter(session.proxies.values()), None)
 
         save_path = config.directories.temp / f"{self.__class__.__name__}_{self.id}.mp4"
         if self.__class__.__name__ == "Subtitle":
@@ -271,7 +270,7 @@ class Track:
                     save_path=save_path,
                     save_dir=save_dir,
                     progress=progress,
-                    session=service.session,
+                    session=session,
                     proxy=proxy,
                     license_widevine=prepare_drm
                 )
@@ -282,7 +281,7 @@ class Track:
                     save_path=save_path,
                     save_dir=save_dir,
                     progress=progress,
-                    session=service.session,
+                    session=session,
                     proxy=proxy,
                     license_widevine=prepare_drm
                 )
@@ -293,13 +292,13 @@ class Track:
                         # the service might not have explicitly defined the `drm` property
                         # try find widevine DRM information from the init data of URL
                         try:
-                            self.drm = [Widevine.from_track(self, service.session)]
+                            self.drm = [Widevine.from_track(self, session)]
                         except Widevine.Exceptions.PSSHNotFound:
                             # it might not have Widevine DRM, or might not have found the PSSH
                             log.warning("No Widevine PSSH was found for this track, is it DRM free?")
 
                     if self.drm:
-                        track_kid = self.get_key_id(session=service.session)
+                        track_kid = self.get_key_id(session=session)
                         drm = self.drm[0]  # just use the first supported DRM system for now
                         if isinstance(drm, Widevine):
                             # license and grab content keys
@@ -317,8 +316,8 @@ class Track:
                         downloader(
                             uri=self.url,
                             out=save_path,
-                            headers=service.session.headers,
-                            cookies=service.session.cookies,
+                            headers=session.headers,
+                            cookies=session.cookies,
                             proxy=proxy,
                             progress=progress
                         )

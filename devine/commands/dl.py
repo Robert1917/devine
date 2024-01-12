@@ -476,7 +476,7 @@ class dl:
                         for download in futures.as_completed((
                             pool.submit(
                                 track.download,
-                                service=service,
+                                session=service.session,
                                 prepare_drm=partial(
                                     partial(
                                         self.prepare_drm,
