@@ -40,18 +40,16 @@ from rich.tree import Tree
 
 from devine.core.config import config
 from devine.core.console import console
-from devine.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack, context_settings
+from devine.core.constants import DOWNLOAD_LICENCE_ONLY, AnyTrack, context_settings
 from devine.core.credential import Credential
-from devine.core.downloaders import downloader
 from devine.core.drm import DRM_T, Widevine
-from devine.core.manifests import DASH, HLS
 from devine.core.proxies import Basic, Hola, NordVPN
 from devine.core.service import Service
 from devine.core.services import Services
 from devine.core.titles import Movie, Song, Title_T
 from devine.core.titles.episode import Episode
 from devine.core.tracks import Audio, Subtitle, Tracks, Video
-from devine.core.utilities import get_binary_path, is_close_match, time_elapsed_since, try_ensure_utf8
+from devine.core.utilities import get_binary_path, is_close_match, time_elapsed_since
 from devine.core.utils.click_types import LANGUAGE_RANGE, QUALITY_LIST, SEASON_RANGE, ContextData
 from devine.core.utils.collections import merge_dict
 from devine.core.utils.subprocess import ffprobe
@@ -477,9 +475,8 @@ class dl:
                     with ThreadPoolExecutor(workers) as pool:
                         for download in futures.as_completed((
                             pool.submit(
-                                self.download_track,
+                                track.download,
                                 service=service,
-                                track=track,
                                 prepare_drm=partial(
                                     partial(
                                         self.prepare_drm,
@@ -795,151 +792,6 @@ class dl:
                         keys[str(title)][str(track)] = {}
                     keys[str(title)][str(track)].update(drm.content_keys)
                     export.write_text(jsonpickle.dumps(keys, indent=4), encoding="utf8")
-
-    def download_track(
-        self,
-        service: Service,
-        track: AnyTrack,
-        prepare_drm: Callable,
-        progress: partial
-    ):
-        if DOWNLOAD_LICENCE_ONLY.is_set():
-            progress(downloaded="[yellow]SKIPPING")
-
-        if DOWNLOAD_CANCELLED.is_set():
-            progress(downloaded="[yellow]CANCELLED")
-            return
-
-        proxy = next(iter(service.session.proxies.values()), None)
-
-        save_path = config.directories.temp / f"{track.__class__.__name__}_{track.id}.mp4"
-        if isinstance(track, Subtitle):
-            save_path = save_path.with_suffix(f".{track.codec.extension}")
-
-        if track.descriptor != track.Descriptor.URL:
-            save_dir = save_path.with_name(save_path.name + "_segments")
-        else:
-            save_dir = save_path.parent
-
-        def cleanup():
-            # track file (e.g., "foo.mp4")
-            save_path.unlink(missing_ok=True)
-            # aria2c control file (e.g., "foo.mp4.aria2")
-            save_path.with_suffix(f"{save_path.suffix}.aria2").unlink(missing_ok=True)
-            if save_dir.exists() and save_dir.name.endswith("_segments"):
-                shutil.rmtree(save_dir)
-
-        if not DOWNLOAD_LICENCE_ONLY.is_set():
-            if config.directories.temp.is_file():
-                self.log.error(f"Temp Directory '{config.directories.temp}' must be a Directory, not a file")
-                sys.exit(1)
-
-            config.directories.temp.mkdir(parents=True, exist_ok=True)
-
-            # Delete any pre-existing temp files matching this track.
-            # We can't re-use or continue downloading these tracks as they do not use a
-            # lock file. Or at least the majority don't. Even if they did I've encountered
-            # corruptions caused by sudden interruptions to the lock file.
-            cleanup()
-
-        try:
-            if track.descriptor == track.Descriptor.M3U:
-                HLS.download_track(
-                    track=track,
-                    save_path=save_path,
-                    save_dir=save_dir,
-                    progress=progress,
-                    session=service.session,
-                    proxy=proxy,
-                    license_widevine=prepare_drm
-                )
-            elif track.descriptor == track.Descriptor.MPD:
-                DASH.download_track(
-                    track=track,
-                    save_path=save_path,
-                    save_dir=save_dir,
-                    progress=progress,
-                    session=service.session,
-                    proxy=proxy,
-                    license_widevine=prepare_drm
-                )
-            # no else-if as DASH may convert the track to URL descriptor
-            if track.descriptor == track.Descriptor.URL:
-                try:
-                    if not track.drm and isinstance(track, (Video, Audio)):
-                        # the service might not have explicitly defined the `drm` property
-                        # try find widevine DRM information from the init data of URL
-                        try:
-                            track.drm = [Widevine.from_track(track, service.session)]
-                        except Widevine.Exceptions.PSSHNotFound:
-                            # it might not have Widevine DRM, or might not have found the PSSH
-                            self.log.warning("No Widevine PSSH was found for this track, is it DRM free?")
-
-                    if track.drm:
-                        track_kid = track.get_key_id(session=service.session)
-                        drm = track.drm[0]  # just use the first supported DRM system for now
-                        if isinstance(drm, Widevine):
-                            # license and grab content keys
-                            if not prepare_drm:
-                                raise ValueError("prepare_drm func must be supplied to use Widevine DRM")
-                            progress(downloaded="LICENSING")
-                            prepare_drm(drm, track_kid=track_kid)
-                            progress(downloaded="[yellow]LICENSED")
-                    else:
-                        drm = None
-
-                    if DOWNLOAD_LICENCE_ONLY.is_set():
-                        progress(downloaded="[yellow]SKIPPED")
-                    else:
-                        downloader(
-                            uri=track.url,
-                            out=save_path,
-                            headers=service.session.headers,
-                            cookies=service.session.cookies,
-                            proxy=proxy,
-                            progress=progress
-                        )
-
-                        track.path = save_path
-
-                        if drm:
-                            progress(downloaded="Decrypting", completed=0, total=100)
-                            drm.decrypt(save_path)
-                            track.drm = None
-                            if callable(track.OnDecrypted):
-                                track.OnDecrypted(track)
-                            progress(downloaded="Decrypted", completed=100)
-
-                        if isinstance(track, Subtitle):
-                            track_data = track.path.read_bytes()
-                            track_data = try_ensure_utf8(track_data)
-                            track_data = html.unescape(track_data.decode("utf8")).encode("utf8")
-                            track.path.write_bytes(track_data)
-
-                        progress(downloaded="Downloaded")
-                except KeyboardInterrupt:
-                    DOWNLOAD_CANCELLED.set()
-                    progress(downloaded="[yellow]CANCELLED")
-                    raise
-                except Exception:
-                    DOWNLOAD_CANCELLED.set()
-                    progress(downloaded="[red]FAILED")
-                    raise
-        except (Exception, KeyboardInterrupt):
-            if not DOWNLOAD_LICENCE_ONLY.is_set():
-                cleanup()
-            raise
-
-        if DOWNLOAD_CANCELLED.is_set():
-            # we stopped during the download, let's exit
-            return
-
-        if not DOWNLOAD_LICENCE_ONLY.is_set():
-            if track.path.stat().st_size <= 3:  # Empty UTF-8 BOM == 3 bytes
-                raise IOError("Download failed, the downloaded file is empty.")
-
-            if callable(track.OnDownloaded):
-                track.OnDownloaded(track)
 
     @staticmethod
     def get_profile(service: str) -> Optional[str]:

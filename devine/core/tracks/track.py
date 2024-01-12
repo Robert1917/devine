@@ -1,8 +1,11 @@
 import base64
+import html
+import logging
 import re
 import shutil
 import subprocess
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Union
 from uuid import UUID
@@ -10,9 +13,12 @@ from uuid import UUID
 import requests
 from langcodes import Language
 
-from devine.core.constants import TERRITORY_MAP
-from devine.core.drm import DRM_T
-from devine.core.utilities import get_binary_path, get_boxes
+from devine.core.config import config
+from devine.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, TERRITORY_MAP
+from devine.core.downloaders import downloader
+from devine.core.drm import DRM_T, Widevine
+from devine.core.service import Service
+from devine.core.utilities import get_binary_path, get_boxes, try_ensure_utf8
 from devine.core.utils.subprocess import ffprobe
 
 
@@ -215,6 +221,148 @@ class Track:
                 raise ValueError(f"Failed to read {content_length} bytes from the track URI.")
 
         return init_data
+
+    def download(self, service: Service, prepare_drm: Callable, progress: partial) -> None:
+        if DOWNLOAD_LICENCE_ONLY.is_set():
+            progress(downloaded="[yellow]SKIPPING")
+
+        if DOWNLOAD_CANCELLED.is_set():
+            progress(downloaded="[yellow]CANCELLED")
+            return
+
+        log = logging.getLogger("Track")
+
+        proxy = next(iter(service.session.proxies.values()), None)
+
+        save_path = config.directories.temp / f"{self.__class__.__name__}_{self.id}.mp4"
+        if self.__class__.__name__ == "Subtitle":
+            save_path = save_path.with_suffix(f".{self.codec.extension}")
+
+        if self.descriptor != self.Descriptor.URL:
+            save_dir = save_path.with_name(save_path.name + "_segments")
+        else:
+            save_dir = save_path.parent
+
+        def cleanup():
+            # track file (e.g., "foo.mp4")
+            save_path.unlink(missing_ok=True)
+            # aria2c control file (e.g., "foo.mp4.aria2")
+            save_path.with_suffix(f"{save_path.suffix}.aria2").unlink(missing_ok=True)
+            if save_dir.exists() and save_dir.name.endswith("_segments"):
+                shutil.rmtree(save_dir)
+
+        if not DOWNLOAD_LICENCE_ONLY.is_set():
+            if config.directories.temp.is_file():
+                raise EnvironmentError(f"Temp Directory '{config.directories.temp}' must be a Directory, not a file")
+
+            config.directories.temp.mkdir(parents=True, exist_ok=True)
+
+            # Delete any pre-existing temp files matching this track.
+            # We can't re-use or continue downloading these tracks as they do not use a
+            # lock file. Or at least the majority don't. Even if they did I've encountered
+            # corruptions caused by sudden interruptions to the lock file.
+            cleanup()
+
+        try:
+            if self.descriptor == self.Descriptor.M3U:
+                from devine.core.manifests import HLS
+                HLS.download_track(
+                    track=self,
+                    save_path=save_path,
+                    save_dir=save_dir,
+                    progress=progress,
+                    session=service.session,
+                    proxy=proxy,
+                    license_widevine=prepare_drm
+                )
+            elif self.descriptor == self.Descriptor.MPD:
+                from devine.core.manifests import DASH
+                DASH.download_track(
+                    track=self,
+                    save_path=save_path,
+                    save_dir=save_dir,
+                    progress=progress,
+                    session=service.session,
+                    proxy=proxy,
+                    license_widevine=prepare_drm
+                )
+            # no else-if as DASH may convert the track to URL descriptor
+            if self.descriptor == self.Descriptor.URL:
+                try:
+                    if not self.drm and self.__class__.__name__ in ("Video", "Audio"):
+                        # the service might not have explicitly defined the `drm` property
+                        # try find widevine DRM information from the init data of URL
+                        try:
+                            self.drm = [Widevine.from_track(self, service.session)]
+                        except Widevine.Exceptions.PSSHNotFound:
+                            # it might not have Widevine DRM, or might not have found the PSSH
+                            log.warning("No Widevine PSSH was found for this track, is it DRM free?")
+
+                    if self.drm:
+                        track_kid = self.get_key_id(session=service.session)
+                        drm = self.drm[0]  # just use the first supported DRM system for now
+                        if isinstance(drm, Widevine):
+                            # license and grab content keys
+                            if not prepare_drm:
+                                raise ValueError("prepare_drm func must be supplied to use Widevine DRM")
+                            progress(downloaded="LICENSING")
+                            prepare_drm(drm, track_kid=track_kid)
+                            progress(downloaded="[yellow]LICENSED")
+                    else:
+                        drm = None
+
+                    if DOWNLOAD_LICENCE_ONLY.is_set():
+                        progress(downloaded="[yellow]SKIPPED")
+                    else:
+                        downloader(
+                            uri=self.url,
+                            out=save_path,
+                            headers=service.session.headers,
+                            cookies=service.session.cookies,
+                            proxy=proxy,
+                            progress=progress
+                        )
+
+                        self.path = save_path
+
+                        if drm:
+                            progress(downloaded="Decrypting", completed=0, total=100)
+                            drm.decrypt(save_path)
+                            self.drm = None
+                            if callable(self.OnDecrypted):
+                                self.OnDecrypted(self)
+                            progress(downloaded="Decrypted", completed=100)
+
+                        if self.__class__.__name__ == "Subtitle":
+                            track_data = self.path.read_bytes()
+                            track_data = try_ensure_utf8(track_data)
+                            track_data = html.unescape(track_data.decode("utf8")).encode("utf8")
+                            self.path.write_bytes(track_data)
+
+                        progress(downloaded="Downloaded")
+                except KeyboardInterrupt:
+                    DOWNLOAD_CANCELLED.set()
+                    progress(downloaded="[yellow]CANCELLED")
+                    raise
+                except Exception:
+                    DOWNLOAD_CANCELLED.set()
+                    progress(downloaded="[red]FAILED")
+                    raise
+        except (Exception, KeyboardInterrupt):
+            if not DOWNLOAD_LICENCE_ONLY.is_set():
+                cleanup()
+            raise
+
+        if DOWNLOAD_CANCELLED.is_set():
+            # we stopped during the download, let's exit
+            return
+
+        if not DOWNLOAD_LICENCE_ONLY.is_set():
+            if self.path.stat().st_size <= 3:  # Empty UTF-8 BOM == 3 bytes
+                raise IOError("Download failed, the downloaded file is empty.")
+
+            if callable(self.OnDownloaded):
+                self.OnDownloaded(self)
 
     def delete(self) -> None:
         if self.path:
