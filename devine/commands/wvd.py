@@ -38,6 +38,7 @@ def add(paths: list[Path]) -> None:
         else:
             # TODO: Check for and log errors
             _ = Device.load(path)  # test if WVD is valid
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(path, dst_path)
             log.info(f"Added {path.stem}")
 
@@ -83,6 +84,10 @@ def parse(path: Path) -> None:
 
     log = logging.getLogger("wvd")
 
+    if not path.exists():
+        console.log(f"[bright_blue]{path.absolute()}[/] does not exist...")
+        return
+
     device = Device.load(path)
 
     log.info(f"System ID: {device.system_id}")
@@ -115,9 +120,23 @@ def dump(wvd_paths: list[Path], out_dir: Path) -> None:
     If the path is relative, with no file extension, it will dump the WVD in the WVDs
     directory.
     """
-    if wvd_paths == (Path(""),):
-        wvd_paths = list(config.directories.wvds.iterdir())
-    for wvd_path, out_path in zip(wvd_paths, (out_dir / x.stem for x in wvd_paths)):
+    log = logging.getLogger("wvd")
+
+    if wvd_paths == ():
+        if not config.directories.wvds.exists():
+            console.log(f"[bright_blue]{config.directories.wvds.absolute()}[/] does not exist...")
+        wvd_paths = list(
+            x
+            for x in config.directories.wvds.iterdir()
+            if x.is_file() and x.suffix.lower() == ".wvd"
+        )
+        if not wvd_paths:
+            console.log(f"[bright_blue]{config.directories.wvds.absolute()}[/] is empty...")
+
+    for i, (wvd_path, out_path) in enumerate(zip(wvd_paths, (out_dir / x.stem for x in wvd_paths))):
+        if i > 0:
+            log.info("")
+
         try:
             named = not wvd_path.suffix and wvd_path.relative_to(Path(""))
         except ValueError:
@@ -126,10 +145,9 @@ def dump(wvd_paths: list[Path], out_dir: Path) -> None:
             wvd_path = config.directories.wvds / f"{wvd_path.stem}.wvd"
         out_path.mkdir(parents=True, exist_ok=True)
 
+        log.info(f"Dumping: {wvd_path}")
         device = Device.load(wvd_path)
 
-        log = logging.getLogger("wvd")
-        log.info(f"Dumping: {wvd_path}")
         log.info(f"L{device.security_level} {device.system_id} {device.type.name}")
         log.info(f"Saving to: {out_path}")
 
