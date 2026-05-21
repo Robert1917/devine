@@ -4,6 +4,7 @@ import logging
 import re
 import shutil
 import subprocess
+from collections import defaultdict
 from copy import copy
 from enum import Enum
 from functools import partial
@@ -12,15 +13,16 @@ from typing import Any, Callable, Iterable, Optional, Union
 from uuid import UUID
 from zlib import crc32
 
-import m3u8
 from langcodes import Language
 from requests import Session
 
+from devine.core import binaries
 from devine.core.config import config
 from devine.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY
 from devine.core.downloaders import aria2c, curl_impersonate, requests
 from devine.core.drm import DRM_T, Widevine
-from devine.core.utilities import get_binary_path, get_boxes, try_ensure_utf8
+from devine.core.events import events
+from devine.core.utilities import get_boxes, try_ensure_utf8
 from devine.core.utils.subprocess import ffprobe
 
 
@@ -41,7 +43,7 @@ class Track:
         drm: Optional[Iterable[DRM_T]] = None,
         edition: Optional[str] = None,
         downloader: Optional[Callable] = None,
-        data: Optional[dict] = None,
+        data: Optional[Union[dict, defaultdict]] = None,
         id_: Optional[str] = None,
     ) -> None:
         if not isinstance(url, (str, list)):
@@ -62,8 +64,8 @@ class Track:
             raise TypeError(f"Expected edition to be a {str}, not {type(edition)}")
         if not isinstance(downloader, (Callable, type(None))):
             raise TypeError(f"Expected downloader to be a {Callable}, not {type(downloader)}")
-        if not isinstance(data, (dict, type(None))):
-            raise TypeError(f"Expected data to be a {dict}, not {type(data)}")
+        if not isinstance(data, (dict, defaultdict, type(None))):
+            raise TypeError(f"Expected data to be a {dict} or {defaultdict}, not {type(data)}")
 
         invalid_urls = ", ".join(set(type(x) for x in url if not isinstance(x, str)))
         if invalid_urls:
@@ -92,6 +94,7 @@ class Track:
         self.drm = drm
         self.edition: str = edition
         self.downloader = downloader
+        self._data: defaultdict[Any, Any] = defaultdict(dict)
         self.data = data or {}
 
         if self.name is None:
@@ -122,17 +125,6 @@ class Track:
         # TODO: Currently using OnFoo event naming, change to just segment_filter
         self.OnSegmentFilter: Optional[Callable] = None
 
-        # Called after one of the Track's segments have downloaded
-        self.OnSegmentDownloaded: Optional[Callable[[Path], None]] = None
-        # Called after the Track has downloaded
-        self.OnDownloaded: Optional[Callable] = None
-        # Called after the Track or one of its segments have been decrypted
-        self.OnDecrypted: Optional[Callable[[DRM_T, Optional[m3u8.Segment]], None]] = None
-        # Called after the Track has been repackaged
-        self.OnRepacked: Optional[Callable] = None
-        # Called before the Track is multiplexed
-        self.OnMultiplex: Optional[Callable] = None
-
     def __repr__(self) -> str:
         return "{name}({items})".format(
             name=self.__class__.__name__,
@@ -142,10 +134,47 @@ class Track:
     def __eq__(self, other: Any) -> bool:
         return isinstance(other, Track) and self.id == other.id
 
+    @property
+    def data(self) -> defaultdict[Any, Any]:
+        """
+        Arbitrary track data dictionary.
+
+        A defaultdict is used with a dict as the factory for easier
+        nested saving and safer exists-checks.
+
+        Reserved keys:
+
+        - "hls" used by the HLS class.
+          - playlist: m3u8.model.Playlist - The primary track information.
+          - media: m3u8.model.Media - The audio/subtitle track information.
+          - segment_durations: list[int] - A list of each segment's duration.
+        - "dash" used by the DASH class.
+          - manifest: lxml.ElementTree - DASH MPD manifest.
+          - period: lxml.Element - The period of this track.
+          - adaptation_set: lxml.Element - The adaptation set of this track.
+          - representation: lxml.Element - The representation of this track.
+          - timescale: int - The timescale of the track's segments.
+          - segment_durations: list[int] - A list of each segment's duration.
+
+        You should not add, change, or remove any data within reserved keys.
+        You may use their data but do note that the values of them may change
+        or be removed at any point.
+        """
+        return self._data
+
+    @data.setter
+    def data(self, value: Union[dict, defaultdict]) -> None:
+        if not isinstance(value, (dict, defaultdict)):
+            raise TypeError(f"Expected data to be a {dict} or {defaultdict}, not {type(value)}")
+        if isinstance(value, dict):
+            value = defaultdict(dict, **value)
+        self._data = value
+
     def download(
         self,
         session: Session,
         prepare_drm: partial,
+        max_workers: Optional[int] = None,
         progress: Optional[partial] = None
     ):
         """Download and optionally Decrypt this Track."""
@@ -202,6 +231,7 @@ class Track:
                     progress=progress,
                     session=session,
                     proxy=proxy,
+                    max_workers=max_workers,
                     license_widevine=prepare_drm
                 )
             elif self.descriptor == self.Descriptor.DASH:
@@ -212,6 +242,7 @@ class Track:
                     progress=progress,
                     session=session,
                     proxy=proxy,
+                    max_workers=max_workers,
                     license_widevine=prepare_drm
                 )
             elif self.descriptor == self.Descriptor.URL:
@@ -247,7 +278,8 @@ class Track:
                             filename=save_path.name,
                             headers=session.headers,
                             cookies=session.cookies,
-                            proxy=proxy
+                            proxy=proxy,
+                            max_workers=max_workers
                         ):
                             file_downloaded = status_update.get("file_downloaded")
                             if not file_downloaded:
@@ -257,15 +289,18 @@ class Track:
                         save_path.with_suffix(f"{save_path.suffix}.aria2__temp").unlink(missing_ok=True)
 
                         self.path = save_path
-                        if callable(self.OnDownloaded):
-                            self.OnDownloaded()
+                        events.emit(events.Types.TRACK_DOWNLOADED, track=self)
 
                         if drm:
                             progress(downloaded="Decrypting", completed=0, total=100)
                             drm.decrypt(save_path)
                             self.drm = None
-                            if callable(self.OnDecrypted):
-                                self.OnDecrypted(drm)
+                            events.emit(
+                                events.Types.TRACK_DECRYPTED,
+                                track=self,
+                                drm=drm,
+                                segment=None
+                            )
                             progress(downloaded="Decrypted", completed=100)
 
                         if track_type == "Subtitle" and self.codec.name not in ("fVTT", "fTTML"):
@@ -299,8 +334,7 @@ class Track:
             if self.path.stat().st_size <= 3:  # Empty UTF-8 BOM == 3 bytes
                 raise IOError("Download failed, the downloaded file is empty.")
 
-        if callable(self.OnDownloaded):
-            self.OnDownloaded(self)
+        events.emit(events.Types.TRACK_DOWNLOADED, track=self)
 
     def delete(self) -> None:
         if self.path:
@@ -475,8 +509,7 @@ class Track:
         if not self.path or not self.path.exists():
             raise ValueError("Cannot repackage a Track that has not been downloaded.")
 
-        executable = get_binary_path("ffmpeg")
-        if not executable:
+        if not binaries.FFMPEG:
             raise EnvironmentError("FFmpeg executable \"ffmpeg\" was not found but is required for this call.")
 
         original_path = self.path
@@ -485,7 +518,7 @@ class Track:
         def _ffmpeg(extra_args: list[str] = None):
             subprocess.run(
                 [
-                    executable, "-hide_banner",
+                    binaries.FFMPEG, "-hide_banner",
                     "-loglevel", "error",
                     "-i", original_path,
                     *(extra_args or []),
@@ -509,6 +542,7 @@ class Track:
             else:
                 raise
 
+        original_path.unlink()
         self.path = output_path
 
 

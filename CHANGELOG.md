@@ -7,6 +7,101 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Versions [3.0.0] and older use a format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 but versions thereafter use a custom changelog format using [git-cliff](https://git-cliff.org).
 
+## [3.3.3] - 2024-05-07
+
+### Bug Fixes
+
+- *dl*: Automatically convert TTML Subs to WebVTT for MKV support
+- *Subtitle*: Correct timestamps when merging fragmented WebVTT
+
+### Changes
+
+- *env*: List all directories as table in info
+- *env*: List possible config path locations when not found
+- *binaries*: Move all binary definitions to core/binaries file
+- *curl-impersonate*: Remove manual fix for curl proxy SSL
+- *curl-impersonate*: Update the default browser to chrome124
+- *Config*: Move possible config paths out of func to constant
+- *utilities*: Remove get_binary_path, use binaries.find instead
+- *dl*: Improve readability of download worker errors
+- *env*: Shorten paths on Windows with env vars
+
+## [3.3.2] - 2024-04-16
+
+### Bug Fixes
+
+- *Video*: Ensure track is supported in change_color_range()
+- *Video*: Optionalise constructor args, add doc-string & checks
+- *Audio*: Optionalise constructor args, add doc-string & checks
+- *Subtitle*: Optionalise constructor args, add doc-string & checks
+- *HLS*: Ensure playlist.stream_info.codecs exists before use
+- *HLS*: Ensure playlist.stream_info.resolution exists before use
+- *env*: List used config path, otherwise the default path
+- *cfg*: Use loaded config path instead of hardcoded default
+- *Basic*: Return None not Exception if no proxy configured
+
+### Changes
+
+- *Video*: Do not print "?"/"Unknown" values in str()
+- *Audio*: Do not print "?"/"Unknown" values in str()
+- *Subtitle*: Do not print "?"/"Unknown" values in str()
+- *Audio*: List lang after codec for consistency with other Tracks
+- *Video*: Return None if no m3u RANGE, not SDR
+- *env*: Use -- to indicate no config found/loaded
+
+### New Contributors
+
+- [retouching](https://github.com/retouching)
+
+## [3.3.1] - 2024-04-05
+
+### Features
+
+- *dl*: Add *new* --workers to set download threads/workers
+
+### Bug Fixes
+
+- *Chapter*: Cast values to int prior to formatting
+- *requests*: Fix multithreaded downloads
+- *Events*: Dereference subscription store from ephemeral store
+
+### Changes
+
+- *dl*: Change --workers to --downloads
+
+### New Contributors
+
+- [knowhere01](https://github.com/knowhere01)
+
+## [3.3.0] - 2024-04-02
+
+### Features
+
+- Add support for MKV Attachments via Attachment class
+- *dl*: Automatically attach fonts used within SSAv4 subs
+- *dl*: Try find SSAv4 fonts in System OS fonts folder
+- *Basic*: Allow single string URIs for countries
+- *Basic*: Allow proxy selection by index (one-indexed)
+- *Events*: Add new global Event Observer API
+
+### Bug Fixes
+
+- *curl-impersonate*: Set Cert-Authority Bundle for HTTPS Proxies
+- *Basic*: Make query case-insensitive
+- *WVD*: Ensure WVDs dir exists before moving WVD file
+- *WVD*: Fix empty path to WVDs folder check
+- *WVD*: Move log out of loop to save performance
+- *WVD*: Move log with path before Device load
+- *WVD*: Add exists/empty checks to WVD folder dumps
+- *Basic*: Fix variable typo regression
+
+### Changes
+
+- *Basic*: Improve proxy format checks
+- *WVD*: Print error if path to parse doesn't exist
+- *WVD*: Seperate logs in loop for visual clarity
+- *Track*: Move from OnXyz callables to Event observer
+
 ## [3.2.0] - 2024-03-25
 
 ### Features
@@ -719,6 +814,10 @@ This release brings a huge change to the fundamentals of Devine's logging, UI, a
 
 Initial public release under the name Devine.
 
+[3.3.3]: https://github.com/devine-dl/devine/releases/tag/v3.3.3
+[3.3.2]: https://github.com/devine-dl/devine/releases/tag/v3.3.2
+[3.3.1]: https://github.com/devine-dl/devine/releases/tag/v3.3.1
+[3.3.0]: https://github.com/devine-dl/devine/releases/tag/v3.3.0
 [3.2.0]: https://github.com/devine-dl/devine/releases/tag/v3.2.0
 [3.1.0]: https://github.com/devine-dl/devine/releases/tag/v3.1.0
 [3.0.0]: https://github.com/devine-dl/devine/releases/tag/v3.0.0

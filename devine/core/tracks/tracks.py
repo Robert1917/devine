@@ -14,6 +14,7 @@ from rich.tree import Tree
 from devine.core.config import config
 from devine.core.console import console
 from devine.core.constants import LANGUAGE_MAX_DISTANCE, AnyTrack, TrackT
+from devine.core.events import events
 from devine.core.tracks.attachment import Attachment
 from devine.core.tracks.audio import Audio
 from devine.core.tracks.chapters import Chapter, Chapters
@@ -315,7 +316,7 @@ class Tracks:
             ][:per_language or None])
         return selected
 
-    def mux(self, title: str, delete: bool = True, progress: Optional[partial] = None) -> tuple[Path, int]:
+    def mux(self, title: str, delete: bool = True, progress: Optional[partial] = None) -> tuple[Path, int, list[str]]:
         """
         Multiplex all the Tracks into a Matroska Container file.
 
@@ -337,8 +338,7 @@ class Tracks:
         for i, vt in enumerate(self.videos):
             if not vt.path or not vt.path.exists():
                 raise ValueError("Video Track must be downloaded before muxing...")
-            if callable(vt.OnMultiplex):
-                vt.OnMultiplex()
+            events.emit(events.Types.TRACK_MULTIPLEX, track=vt)
             cl.extend([
                 "--language", f"0:{vt.language}",
                 "--default-track", f"0:{i == 0}",
@@ -350,8 +350,7 @@ class Tracks:
         for i, at in enumerate(self.audio):
             if not at.path or not at.path.exists():
                 raise ValueError("Audio Track must be downloaded before muxing...")
-            if callable(at.OnMultiplex):
-                at.OnMultiplex()
+            events.emit(events.Types.TRACK_MULTIPLEX, track=at)
             cl.extend([
                 "--track-name", f"0:{at.get_track_name() or ''}",
                 "--language", f"0:{at.language}",
@@ -365,8 +364,7 @@ class Tracks:
         for st in self.subtitles:
             if not st.path or not st.path.exists():
                 raise ValueError("Text Track must be downloaded before muxing...")
-            if callable(st.OnMultiplex):
-                st.OnMultiplex()
+            events.emit(events.Types.TRACK_MULTIPLEX, track=st)
             default = bool(self.audio and is_close_match(st.language, [self.audio[0].language]) and st.forced)
             cl.extend([
                 "--track-name", f"0:{st.get_track_name() or ''}",
@@ -412,15 +410,18 @@ class Tracks:
 
         # let potential failures go to caller, caller should handle
         try:
+            errors = []
             p = subprocess.Popen([
                 *cl,
                 "--output", str(output_path),
                 "--gui-mode"
             ], text=True, stdout=subprocess.PIPE)
             for line in iter(p.stdout.readline, ""):
+                if line.startswith("#GUI#error") or line.startswith("#GUI#warning"):
+                    errors.append(line)
                 if "progress" in line:
                     progress(total=100, completed=int(line.strip()[14:-1]))
-            return output_path, p.wait()
+            return output_path, p.wait(), errors
         finally:
             if chapters_path:
                 # regardless of delete param, we delete as it's a file we made during muxing

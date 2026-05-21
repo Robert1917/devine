@@ -38,11 +38,13 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
+from devine.core import binaries
 from devine.core.config import config
 from devine.core.console import console
 from devine.core.constants import DOWNLOAD_LICENCE_ONLY, AnyTrack, context_settings
 from devine.core.credential import Credential
 from devine.core.drm import DRM_T, Widevine
+from devine.core.events import events
 from devine.core.proxies import Basic, Hola, NordVPN
 from devine.core.service import Service
 from devine.core.services import Services
@@ -50,7 +52,7 @@ from devine.core.titles import Movie, Song, Title_T
 from devine.core.titles.episode import Episode
 from devine.core.tracks import Audio, Subtitle, Tracks, Video
 from devine.core.tracks.attachment import Attachment
-from devine.core.utilities import get_binary_path, get_system_fonts, is_close_match, time_elapsed_since
+from devine.core.utilities import get_system_fonts, is_close_match, time_elapsed_since
 from devine.core.utils.click_types import LANGUAGE_RANGE, QUALITY_LIST, SEASON_RANGE, ContextData, MultipleChoice
 from devine.core.utils.collections import merge_dict
 from devine.core.utils.subprocess import ffprobe
@@ -130,8 +132,10 @@ class dl:
                   help="Disable folder creation for TV Shows.")
     @click.option("--no-source", is_flag=True, default=False,
                   help="Disable the source tag from the output file name and path.")
-    @click.option("--workers", type=int, default=1,
-                  help="Max concurrent workers to use throughout the code, particularly downloads.")
+    @click.option("--workers", type=int, default=None,
+                  help="Max workers/threads to download with per-track. Default depends on the downloader.")
+    @click.option("--downloads", type=int, default=1,
+                  help="Amount of tracks to download concurrently.")
     @click.pass_context
     def cli(ctx: click.Context, **kwargs: Any) -> dl:
         return dl(ctx, **kwargs)
@@ -174,9 +178,10 @@ class dl:
             except ValueError as e:
                 self.log.error(f"Failed to load Widevine CDM, {e}")
                 sys.exit(1)
-            self.log.info(
-                f"Loaded {self.cdm.__class__.__name__} Widevine CDM: {self.cdm.system_id} (L{self.cdm.security_level})"
-            )
+            if self.cdm:
+                self.log.info(
+                    f"Loaded {self.cdm.__class__.__name__} Widevine CDM: {self.cdm.system_id} (L{self.cdm.security_level})"
+                )
 
         with console.status("Loading Key Vaults...", spinner="dots"):
             self.vaults = Vaults(self.service)
@@ -195,7 +200,7 @@ class dl:
                     self.proxy_providers.append(Basic(**config.proxy_providers["basic"]))
                 if config.proxy_providers.get("nordvpn"):
                     self.proxy_providers.append(NordVPN(**config.proxy_providers["nordvpn"]))
-                if get_binary_path("hola-proxy"):
+                if binaries.HolaProxy:
                     self.proxy_providers.append(Hola())
                 for proxy_provider in self.proxy_providers:
                     self.log.info(f"Loaded {proxy_provider.__class__.__name__}: {proxy_provider}")
@@ -274,7 +279,8 @@ class dl:
         no_proxy: bool,
         no_folder: bool,
         no_source: bool,
-        workers: int,
+        workers: Optional[int],
+        downloads: int,
         *_: Any,
         **__: Any
     ) -> None:
@@ -324,6 +330,14 @@ class dl:
                 with console.status(f"Delaying by {delay} seconds..."):
                     time.sleep(delay)
 
+            with console.status("Subscribing to events...", spinner="dots"):
+                events.reset()
+                events.subscribe(events.Types.SEGMENT_DOWNLOADED, service.on_segment_downloaded)
+                events.subscribe(events.Types.TRACK_DOWNLOADED, service.on_track_downloaded)
+                events.subscribe(events.Types.TRACK_DECRYPTED, service.on_track_decrypted)
+                events.subscribe(events.Types.TRACK_REPACKED, service.on_track_repacked)
+                events.subscribe(events.Types.TRACK_MULTIPLEX, service.on_track_multiplex)
+
             with console.status("Getting tracks...", spinner="dots"):
                 title.tracks.add(service.get_tracks(title), warn_only=True)
                 title.tracks.chapters = service.get_chapters(title)
@@ -339,8 +353,13 @@ class dl:
                     non_sdh_sub = deepcopy(subtitle)
                     non_sdh_sub.id += "_stripped"
                     non_sdh_sub.sdh = False
-                    non_sdh_sub.OnMultiplex = lambda: non_sdh_sub.strip_hearing_impaired()
                     title.tracks.add(non_sdh_sub)
+                    events.subscribe(
+                        events.Types.TRACK_MULTIPLEX,
+                        lambda track: (
+                            track.strip_hearing_impaired()
+                        ) if track.id == non_sdh_sub.id else None
+                    )
 
             with console.status("Sorting tracks by language and bitrate...", spinner="dots"):
                 title.tracks.sort_videos(by_language=v_lang or lang)
@@ -488,7 +507,7 @@ class dl:
                     console=console,
                     refresh_per_second=5
                 ):
-                    with ThreadPoolExecutor(workers) as pool:
+                    with ThreadPoolExecutor(downloads) as pool:
                         for download in futures.as_completed((
                             pool.submit(
                                 track.download,
@@ -514,6 +533,7 @@ class dl:
                                     vaults_only=vaults_only,
                                     export=export
                                 ),
+                                max_workers=workers,
                                 progress=tracks_progress_callables[i]
                             )
                             for i, track in enumerate(title.tracks)
@@ -528,14 +548,17 @@ class dl:
             except Exception as e:  # noqa
                 error_messages = [
                     ":x: Download Failed...",
-                    "   One of the download workers had an error!",
-                    "   See the error trace above for more information."
                 ]
-                if isinstance(e, subprocess.CalledProcessError):
-                    # ignore process exceptions as proper error logs are already shown
-                    error_messages.append(f"   Process exit code: {e.returncode}")
+                if isinstance(e, EnvironmentError):
+                    error_messages.append(f"   {e}")
                 else:
-                    console.print_exception()
+                    error_messages.append("   An unexpected error occurred in one of the download workers.",)
+                    if hasattr(e, "returncode"):
+                        error_messages.append(f"   Binary call failed, Process exit code: {e.returncode}")
+                    error_messages.append("   See the error trace above for more information.")
+                    if isinstance(e, subprocess.CalledProcessError):
+                        # CalledProcessError already lists the exception trace
+                        console.print_exception()
                 console.print(Padding(
                     Group(*error_messages),
                     (1, 5)
@@ -592,11 +615,14 @@ class dl:
                             break
                     video_track_n += 1
 
-                if sub_format:
-                    with console.status(f"Converting Subtitles to {sub_format.name}..."):
-                        for subtitle in title.tracks.subtitles:
+                with console.status("Converting Subtitles..."):
+                    for subtitle in title.tracks.subtitles:
+                        if sub_format:
                             if subtitle.codec != sub_format:
                                 subtitle.convert(sub_format)
+                        elif subtitle.codec == Subtitle.Codec.TimedTextMarkupLang:
+                            # MKV does not support TTML, VTT is the next best option
+                            subtitle.convert(Subtitle.Codec.WebVTT)
 
                 with console.status("Checking Subtitles for Fonts..."):
                     font_names = []
@@ -636,8 +662,7 @@ class dl:
                         if track.needs_repack:
                             track.repackage()
                             has_repacked = True
-                            if callable(track.OnRepacked):
-                                track.OnRepacked()
+                            events.emit(events.Types.TRACK_REPACKED, track=track)
                     if has_repacked:
                         # we don't want to fill up the log with "Repacked x track"
                         self.log.info("Repacked one or more tracks with FFMPEG")
@@ -677,16 +702,22 @@ class dl:
                     ):
                         for task_id, task_tracks in multiplex_tasks:
                             progress.start_task(task_id)  # TODO: Needed?
-                            muxed_path, return_code = task_tracks.mux(
+                            muxed_path, return_code, errors = task_tracks.mux(
                                 str(title),
                                 progress=partial(progress.update, task_id=task_id),
                                 delete=False
                             )
                             muxed_paths.append(muxed_path)
-                            if return_code == 1:
-                                self.log.warning("mkvmerge had at least one warning, will continue anyway...")
-                            elif return_code >= 2:
-                                self.log.error(f"Failed to Mux video to Matroska file ({return_code})")
+                            if return_code >= 2:
+                                self.log.error(f"Failed to Mux video to Matroska file ({return_code}):")
+                            elif return_code == 1 or errors:
+                                self.log.warning("mkvmerge had at least one warning or error, continuing anyway...")
+                            for line in errors:
+                                if line.startswith("#GUI#error"):
+                                    self.log.error(line)
+                                else:
+                                    self.log.warning(line)
+                            if return_code >= 2:
                                 sys.exit(1)
                             for video_track in task_tracks.videos:
                                 video_track.delete()
@@ -906,21 +937,21 @@ class dl:
                 return Credential.loads(credentials)  # type: ignore
 
     @staticmethod
-    def get_cdm(service: str, profile: Optional[str] = None) -> WidevineCdm:
+    def get_cdm(service: str, profile: Optional[str] = None) -> Optional[WidevineCdm]:
         """
         Get CDM for a specified service (either Local or Remote CDM).
         Raises a ValueError if there's a problem getting a CDM.
         """
         cdm_name = config.cdm.get(service) or config.cdm.get("default")
         if not cdm_name:
-            raise ValueError("A CDM to use wasn't listed in the config")
+            return None
 
         if isinstance(cdm_name, dict):
             if not profile:
-                raise ValueError("CDM config is mapped for profiles, but no profile was chosen")
+                return None
             cdm_name = cdm_name.get(profile) or config.cdm.get("default")
             if not cdm_name:
-                raise ValueError(f"A CDM to use was not mapped for the profile {profile}")
+                return None
 
         cdm_api = next(iter(x for x in config.remote_cdm if x["name"] == cdm_name), None)
         if cdm_api:

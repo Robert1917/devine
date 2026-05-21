@@ -7,7 +7,7 @@ from enum import Enum
 from functools import partial
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Union
 
 import pycaption
 import requests
@@ -17,8 +17,10 @@ from pycaption.geometry import Layout
 from pymp4.parser import MP4
 from subtitle_filter import Subtitles
 
+from devine.core import binaries
 from devine.core.tracks.track import Track
-from devine.core.utilities import get_binary_path, try_ensure_utf8
+from devine.core.utilities import try_ensure_utf8
+from devine.core.utils.webvtt import merge_segmented_webvtt
 
 
 class Subtitle(Track):
@@ -74,22 +76,22 @@ class Subtitle(Track):
                 return Subtitle.Codec.TimedTextMarkupLang
             raise ValueError(f"The Content Profile '{profile}' is not a supported Subtitle Codec")
 
-    def __init__(self, *args: Any, codec: Subtitle.Codec, cc: bool = False, sdh: bool = False, forced: bool = False,
-                 **kwargs: Any):
+    def __init__(
+        self,
+        *args: Any,
+        codec: Optional[Subtitle.Codec] = None,
+        cc: bool = False,
+        sdh: bool = False,
+        forced: bool = False,
+        **kwargs: Any
+    ):
         """
-        Information on Subtitle Types:
-            https://bit.ly/2Oe4fLC (3PlayMedia Blog on SUB vs CC vs SDH).
-            However, I wouldn't pay much attention to the claims about SDH needing to
-            be in the original source language. It's logically not true.
-
-            CC == Closed Captions. Source: Basically every site.
-            SDH = Subtitles for the Deaf or Hard-of-Hearing. Source: Basically every site.
-            HOH = Exact same as SDH. Is a term used in the UK. Source: https://bit.ly/2PGJatz (ICO UK)
-
-            More in-depth information, examples, and stuff to look for can be found in the Parameter
-            explanation list below.
+        Create a new Subtitle track object.
 
         Parameters:
+            codec: A Subtitle.Codec enum representing the subtitle format.
+                If not specified, MediaInfo will be used to retrieve the format
+                once the track has been downloaded.
             cc: Closed Caption.
                 - Intended as if you couldn't hear the audio at all.
                 - Can have Sound as well as Dialogue, but doesn't have to.
@@ -125,19 +127,56 @@ class Subtitle(Track):
                      no other way to reliably work with Forced subtitles where multiple
                      forced subtitles may be in the output file. Just know what to expect
                      with "forced" subtitles.
+
+        Note: If codec is not specified some checks may be skipped or assume a value.
+        Specifying as much information as possible is highly recommended.
+
+        Information on Subtitle Types:
+            https://bit.ly/2Oe4fLC (3PlayMedia Blog on SUB vs CC vs SDH).
+            However, I wouldn't pay much attention to the claims about SDH needing to
+            be in the original source language. It's logically not true.
+
+            CC == Closed Captions. Source: Basically every site.
+            SDH = Subtitles for the Deaf or Hard-of-Hearing. Source: Basically every site.
+            HOH = Exact same as SDH. Is a term used in the UK. Source: https://bit.ly/2PGJatz (ICO UK)
+
+            More in-depth information, examples, and stuff to look for can be found in the Parameter
+            explanation list above.
         """
         super().__init__(*args, **kwargs)
+
+        if not isinstance(codec, (Subtitle.Codec, type(None))):
+            raise TypeError(f"Expected codec to be a {Subtitle.Codec}, not {codec!r}")
+        if not isinstance(cc, (bool, int)) or (isinstance(cc, int) and cc not in (0, 1)):
+            raise TypeError(f"Expected cc to be a {bool} or bool-like {int}, not {cc!r}")
+        if not isinstance(sdh, (bool, int)) or (isinstance(sdh, int) and sdh not in (0, 1)):
+            raise TypeError(f"Expected sdh to be a {bool} or bool-like {int}, not {sdh!r}")
+        if not isinstance(forced, (bool, int)) or (isinstance(forced, int) and forced not in (0, 1)):
+            raise TypeError(f"Expected forced to be a {bool} or bool-like {int}, not {forced!r}")
+
         self.codec = codec
+
         self.cc = bool(cc)
         self.sdh = bool(sdh)
+        self.forced = bool(forced)
+
         if self.cc and self.sdh:
             raise ValueError("A text track cannot be both CC and SDH.")
-        self.forced = bool(forced)
-        if (self.cc or self.sdh) and self.forced:
+
+        if self.forced and (self.cc or self.sdh):
             raise ValueError("A text track cannot be CC/SDH as well as Forced.")
 
+        # TODO: Migrate to new event observer system
         # Called after Track has been converted to another format
         self.OnConverted: Optional[Callable[[Subtitle.Codec], None]] = None
+
+    def __str__(self) -> str:
+        return " | ".join(filter(bool, [
+            "SUB",
+            f"[{self.codec.value}]" if self.codec else None,
+            str(self.language),
+            self.get_track_name()
+        ]))
 
     def get_track_name(self) -> Optional[str]:
         """Return the base Track Name."""
@@ -153,9 +192,10 @@ class Subtitle(Track):
         self,
         session: requests.Session,
         prepare_drm: partial,
+        max_workers: Optional[int] = None,
         progress: Optional[partial] = None
     ):
-        super().download(session, prepare_drm, progress)
+        super().download(session, prepare_drm, max_workers, progress)
         if not self.path:
             return
 
@@ -163,6 +203,26 @@ class Subtitle(Track):
             self.convert(Subtitle.Codec.TimedTextMarkupLang)
         elif self.codec == Subtitle.Codec.fVTT:
             self.convert(Subtitle.Codec.WebVTT)
+        elif self.codec == Subtitle.Codec.WebVTT:
+            text = self.path.read_text("utf8")
+            if self.descriptor == Track.Descriptor.DASH:
+                if len(self.data["dash"]["segment_durations"]) > 1:
+                    text = merge_segmented_webvtt(
+                        text,
+                        segment_durations=self.data["dash"]["segment_durations"],
+                        timescale=self.data["dash"]["timescale"]
+                    )
+            elif self.descriptor == Track.Descriptor.HLS:
+                if len(self.data["hls"]["segment_durations"]) > 1:
+                    text = merge_segmented_webvtt(
+                        text,
+                        segment_durations=self.data["hls"]["segment_durations"],
+                        timescale=1  # ?
+                    )
+            caption_set = pycaption.WebVTTReader().read(text)
+            Subtitle.merge_same_cues(caption_set)
+            subtitle_text = pycaption.WebVTTWriter().write(caption_set)
+            self.path.write_text(subtitle_text, encoding="utf8")
 
     def convert(self, codec: Subtitle.Codec) -> Path:
         """
@@ -195,14 +255,13 @@ class Subtitle(Track):
 
         output_path = self.path.with_suffix(f".{codec.value.lower()}")
 
-        sub_edit_executable = get_binary_path("SubtitleEdit")
-        if sub_edit_executable and self.codec not in (Subtitle.Codec.fTTML, Subtitle.Codec.fVTT):
+        if binaries.SubtitleEdit and self.codec not in (Subtitle.Codec.fTTML, Subtitle.Codec.fVTT):
             sub_edit_format = {
                 Subtitle.Codec.SubStationAlphav4: "AdvancedSubStationAlpha",
                 Subtitle.Codec.TimedTextMarkupLang: "TimedText1.0"
             }.get(codec, codec.name)
             sub_edit_args = [
-                sub_edit_executable,
+                binaries.SubtitleEdit,
                 "/Convert", self.path, sub_edit_format,
                 f"/outputfilename:{output_path.name}",
                 "/encoding:utf8"
@@ -270,14 +329,7 @@ class Subtitle(Track):
                 caption_lists[language] = caption_list
                 caption_set: pycaption.CaptionSet = pycaption.CaptionSet(caption_lists)
             elif codec == Subtitle.Codec.WebVTT:
-                text = try_ensure_utf8(data).decode("utf8")
-                # Segmented VTT when merged may have the WEBVTT headers part of the next caption
-                # if they are not separated far enough from the previous caption, hence the \n\n
-                text = text. \
-                    replace("WEBVTT", "\n\nWEBVTT"). \
-                    replace("\r", ""). \
-                    replace("\n\n\n", "\n \n\n"). \
-                    replace("\n\n<", "\n<")
+                text = Subtitle.space_webvtt_headers(data)
                 caption_set = pycaption.WebVTTReader().read(text)
             else:
                 raise ValueError(f"Unknown Subtitle format \"{codec}\"...")
@@ -293,6 +345,27 @@ class Subtitle(Track):
                 del caption_set._captions[language]
 
         return caption_set
+
+    @staticmethod
+    def space_webvtt_headers(data: Union[str, bytes]):
+        """
+        Space out the WEBVTT Headers from Captions.
+
+        Segmented VTT when merged may have the WEBVTT headers part of the next caption
+        as they were not separated far enough from the previous caption and ended up
+        being considered as caption text rather than the header for the next segment.
+        """
+        if isinstance(data, bytes):
+            data = try_ensure_utf8(data).decode("utf8")
+        elif not isinstance(data, str):
+            raise ValueError(f"Expecting data to be a str, not {data!r}")
+
+        text = data.replace("WEBVTT", "\n\nWEBVTT").\
+            replace("\r", "").\
+            replace("\n\n\n", "\n \n\n").\
+            replace("\n\n<", "\n<")
+
+        return text
 
     @staticmethod
     def merge_same_cues(caption_set: pycaption.CaptionSet):
@@ -462,8 +535,7 @@ class Subtitle(Track):
         if not self.path or not self.path.exists():
             raise ValueError("You must download the subtitle track first.")
 
-        executable = get_binary_path("SubtitleEdit")
-        if executable:
+        if binaries.SubtitleEdit:
             if self.codec == Subtitle.Codec.SubStationAlphav4:
                 output_format = "AdvancedSubStationAlpha"
             elif self.codec == Subtitle.Codec.TimedTextMarkupLang:
@@ -472,7 +544,7 @@ class Subtitle(Track):
                 output_format = self.codec.name
             subprocess.run(
                 [
-                    executable,
+                    binaries.SubtitleEdit,
                     "/Convert", self.path, output_format,
                     "/encoding:utf8",
                     "/overwrite",
@@ -501,8 +573,7 @@ class Subtitle(Track):
         if not self.path or not self.path.exists():
             raise ValueError("You must download the subtitle track first.")
 
-        executable = get_binary_path("SubtitleEdit")
-        if not executable:
+        if not binaries.SubtitleEdit:
             raise EnvironmentError("SubtitleEdit executable not found...")
 
         if self.codec == Subtitle.Codec.SubStationAlphav4:
@@ -514,7 +585,7 @@ class Subtitle(Track):
 
         subprocess.run(
             [
-                executable,
+                binaries.SubtitleEdit,
                 "/Convert", self.path, output_format,
                 "/ReverseRtlStartEnd",
                 "/encoding:utf8",
@@ -523,14 +594,6 @@ class Subtitle(Track):
             check=True,
             stdout=subprocess.DEVNULL
         )
-
-    def __str__(self) -> str:
-        return " | ".join(filter(bool, [
-            "SUB",
-            f"[{self.codec.value}]",
-            str(self.language),
-            self.get_track_name()
-        ]))
 
 
 __all__ = ("Subtitle",)

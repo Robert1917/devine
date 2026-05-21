@@ -33,9 +33,9 @@ class Basic(Proxy):
         country_code = match.group(1)
         entry = match.group(2)
 
-        servers: Optional[Union[str, list[str]]] = self._data.get(country_code)
+        servers: Optional[Union[str, list[str]]] = self.countries.get(country_code)
         if not servers:
-            raise ValueError(f"There's no proxies configured for \"{country_code}\"...")
+            return None
 
         if isinstance(servers, str):
             proxy = servers

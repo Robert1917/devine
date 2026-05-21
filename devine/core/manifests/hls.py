@@ -19,11 +19,13 @@ from pywidevine.cdm import Cdm as WidevineCdm
 from pywidevine.pssh import PSSH
 from requests import Session
 
+from devine.core import binaries
 from devine.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack
 from devine.core.downloaders import requests as requests_downloader
 from devine.core.drm import DRM_T, ClearKey, Widevine
+from devine.core.events import events
 from devine.core.tracks import Audio, Subtitle, Tracks, Video
-from devine.core.utilities import get_binary_path, get_extension, is_close_match, try_ensure_utf8
+from devine.core.utilities import get_extension, is_close_match, try_ensure_utf8
 
 
 class HLS:
@@ -100,7 +102,8 @@ class HLS:
 
             try:
                 # TODO: Any better way to figure out the primary track type?
-                Video.Codec.from_codecs(playlist.stream_info.codecs)
+                if playlist.stream_info.codecs:
+                    Video.Codec.from_codecs(playlist.stream_info.codecs)
             except ValueError:
                 primary_track_type = Audio
             else:
@@ -109,7 +112,10 @@ class HLS:
             tracks.add(primary_track_type(
                 id_=hex(crc32(str(playlist).encode()))[2:],
                 url=urljoin(playlist.base_uri, playlist.uri),
-                codec=primary_track_type.Codec.from_codecs(playlist.stream_info.codecs),
+                codec=(
+                    primary_track_type.Codec.from_codecs(playlist.stream_info.codecs)
+                    if playlist.stream_info.codecs else None
+                ),
                 language=language,  # HLS manifests do not seem to have language info
                 is_original_lang=True,  # TODO: All we can do is assume Yes
                 bitrate=playlist.stream_info.average_bandwidth or playlist.stream_info.bandwidth,
@@ -124,10 +130,10 @@ class HLS:
                 **(dict(
                     range_=Video.Range.DV if any(
                         codec.split(".")[0] in ("dva1", "dvav", "dvhe", "dvh1")
-                        for codec in playlist.stream_info.codecs.lower().split(",")
+                        for codec in (playlist.stream_info.codecs or "").lower().split(",")
                     ) else Video.Range.from_m3u_range_tag(playlist.stream_info.video_range),
-                    width=playlist.stream_info.resolution[0],
-                    height=playlist.stream_info.resolution[1],
+                    width=playlist.stream_info.resolution[0] if playlist.stream_info.resolution else None,
+                    height=playlist.stream_info.resolution[1] if playlist.stream_info.resolution else None,
                     fps=playlist.stream_info.frame_rate
                 ) if primary_track_type is Video else {})
             ))
@@ -196,6 +202,7 @@ class HLS:
         progress: partial,
         session: Optional[Session] = None,
         proxy: Optional[str] = None,
+        max_workers: Optional[int] = None,
         license_widevine: Optional[Callable] = None
     ) -> None:
         if not session:
@@ -247,17 +254,24 @@ class HLS:
         progress(total=total_segments)
 
         downloader = track.downloader
+        if (
+            downloader.__name__ == "aria2c" and
+            any(x.byterange for x in master.segments if x not in unwanted_segments)
+        ):
+            downloader = requests_downloader
+            log.warning("Falling back to the requests downloader as aria2(c) doesn't support the Range header")
 
         urls: list[dict[str, Any]] = []
+        segment_durations: list[int] = []
+
         range_offset = 0
         for segment in master.segments:
             if segment in unwanted_segments:
                 continue
 
+            segment_durations.append(int(segment.duration))
+
             if segment.byterange:
-                if downloader.__name__ == "aria2c":
-                    # aria2(c) is shit and doesn't support the Range header, fallback to the requests downloader
-                    downloader = requests_downloader
                 byte_range = HLS.calculate_byte_range(segment.byterange, range_offset)
                 range_offset = byte_range.split("-")[0]
             else:
@@ -270,6 +284,8 @@ class HLS:
                 } if byte_range else {}
             })
 
+        track.data["hls"]["segment_durations"] = segment_durations
+
         segment_save_dir = save_dir / "segments"
 
         for status_update in downloader(
@@ -279,11 +295,11 @@ class HLS:
             headers=session.headers,
             cookies=session.cookies,
             proxy=proxy,
-            max_workers=16
+            max_workers=max_workers
         ):
             file_downloaded = status_update.get("file_downloaded")
-            if file_downloaded and callable(track.OnSegmentDownloaded):
-                track.OnSegmentDownloaded(file_downloaded)
+            if file_downloaded:
+                events.emit(events.Types.SEGMENT_DOWNLOADED, track=track, segment=file_downloaded)
             else:
                 downloaded = status_update.get("downloaded")
                 if downloaded and downloaded.endswith("/s"):
@@ -371,18 +387,34 @@ class HLS:
                 elif len(files) != range_len:
                     raise ValueError(f"Missing {range_len - len(files)} segment files for {segment_range}...")
 
-                merge(
-                    to=merged_path,
-                    via=files,
-                    delete=True,
-                    include_map_data=True
+                if isinstance(drm, Widevine):
+                    # with widevine we can merge all segments and decrypt once
+                    merge(
+                        to=merged_path,
+                        via=files,
+                        delete=True,
+                        include_map_data=True
+                    )
+                    drm.decrypt(merged_path)
+                    merged_path.rename(decrypted_path)
+                else:
+                    # with other drm we must decrypt separately and then merge them
+                    # for aes this is because each segment likely has 16-byte padding
+                    for file in files:
+                        drm.decrypt(file)
+                    merge(
+                        to=merged_path,
+                        via=files,
+                        delete=True,
+                        include_map_data=True
+                    )
+
+                events.emit(
+                    events.Types.TRACK_DECRYPTED,
+                    track=track,
+                    drm=drm,
+                    segment=decrypted_path
                 )
-
-                drm.decrypt(merged_path)
-                merged_path.rename(decrypted_path)
-
-                if callable(track.OnDecrypted):
-                    track.OnDecrypted(drm, decrypted_path)
 
                 return decrypted_path
 
@@ -537,8 +569,7 @@ class HLS:
         progress(downloaded="Downloaded")
 
         track.path = save_path
-        if callable(track.OnDownloaded):
-            track.OnDownloaded()
+        events.emit(events.Types.TRACK_DOWNLOADED, track=track)
 
     @staticmethod
     def merge_segments(segments: list[Path], save_path: Path) -> int:
@@ -547,8 +578,7 @@ class HLS:
 
         Returns the file size of the merged file.
         """
-        ffmpeg = get_binary_path("ffmpeg")
-        if not ffmpeg:
+        if not binaries.FFMPEG:
             raise EnvironmentError("FFmpeg executable was not found but is required to merge HLS segments.")
 
         demuxer_file = segments[0].parent / "ffmpeg_concat_demuxer.txt"
@@ -558,7 +588,7 @@ class HLS:
         ]))
 
         subprocess.check_call([
-            ffmpeg, "-hide_banner",
+            binaries.FFMPEG, "-hide_banner",
             "-loglevel", "panic",
             "-f", "concat",
             "-safe", "0",
